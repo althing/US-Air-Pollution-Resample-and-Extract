@@ -1,0 +1,351 @@
+
+# written for R Open 3.5.1.
+#When using VS Code set R version with this line of code in the settings:
+##  "r.rterm.windows": "C:\\Program Files\\Microsoft\\R Open\\R-3.5.1\\bin\\x64\\R.exe"
+#To change to a more current version of R, use something like this:
+##  "r.rterm.windows": "C:\\Program Files\\R\\R-4.0.2\\bin\\x64\\R.exe"
+##  remember to include Checkpoint library for version control when using non-'R Open' versions of R.
+
+
+#set home folder:
+setwd()
+
+
+tempdir <- function() "L:/R_temp1"
+unlockBinding("tempdir", baseenv())
+assignInNamespace("tempdir", tempdir, ns = "base", envir = baseenv())
+assign("tempdir", tempdir, baseenv())
+lockBinding("tempdir", baseenv())
+
+#version control (if not using R Open)
+if (FALSE) {
+
+    library(checkpoint)
+    checkpoint("2020-07-01", scanForPackages = TRUE)
+    setSnapshot("2020-07-01")
+
+}
+
+
+#library(maptools) #readShapePoly function
+
+library(rgdal) #has function readOGR to read shape files. Replaces depricated readshapepolly in maptools package.
+library(foreach) #multicore frontend foreach command
+#library(doParallel) #redundant with doSNOW
+#library(doSNOW) #connects foreach with parallel package backend----
+library(sp)
+library(raster) #for resampling
+library(data.table) #setnames function
+
+library(tigris) #for census bureau admin shapefiles
+library(readr) #write_excel_csv function
+library(velox)
+#format(object.size(x.stack), units = "Mb")
+
+#start time----
+start.time <- Sys.time()
+start.time
+
+
+#define parameters for resample resolution and output file name----
+
+#define year(s) to be covered.----
+#manually define year(s) to import resample and export to .csv
+#each year covered must be entered individually as characters.
+#doing too many with too high of a resolution will cause problems (3 on full res has been safe so far, but it can probably do more).
+years.covered <- c("2016")  #1.75 hours per year for all three admin units.
+
+
+
+#define resolution----
+
+#'full' res##
+res.char <- "0.0125sq" #(~1.2km sq)
+new.res <- raster(nrow = 14400, ncol = 28800) # for OMI no2 data: increases resolution by x10 on both axese to 0.0125 by 0.0125 degrees for OMI data (x20 for METOP data).
+
+##low res##
+#res.char <- "0_0625sq"
+#new.res <- raster(nrow = 2880, ncol = 5760) #increase resolution by x2 on both axes for OMI data. (x4 for METOP-A and -B)
+
+#NOTE:
+####select resample.resolution####
+#original res for OMI NO2 data:
+##0.125 by 0.125 degrees
+##1440  by 2880 cells (for no2)
+
+#res of resampled NASA PM2.5 rolling mean data
+#roughly 0.01 by 0.01 degrees
+#12500 by 36000 cells.
+
+
+#sensor name and resample method----
+
+sensor.name <- "OMI with METOPa and b"
+
+#resample method
+resample.method <- "bilinear" #'bilinear' for bilinear and 'ngb' for nearest neighbor.
+
+
+
+
+#import administrative unit shapefiles----
+
+#country
+usa.shp <- readOGR("./admin_shape_files/gadm36_USA_0.shp")
+
+#states
+if (!file.exists("./admin_shape_files/tl_2016_us_state.shp")) {
+    states.shp <- states(cb = FALSE, resolution = "500k", year = 2016)
+    unzip("./tl_2016_us_state.zip", exdir = "./admin_shape_files")
+}
+if (file.exists("./admin_shape_files/tl_2016_us_state.shp")) {
+    states.shp <- readOGR("./admin_shape_files/tl_2016_us_state.shp")
+}
+
+#csa's
+if (!file.exists("./admin_shape_files/tl_2015_us_csa.shp")) {
+    csa.shp <- combined_statistical_areas(cb = FALSE, resolution = "500k", year = 2015)
+    unzip("./tl_2015_us_csa.zip", exdir = "./admin_shape_files")
+}
+if (file.exists("./admin_shape_files/tl_2015_us_csa.shp")) {
+    csa.shp <- readOGR("./admin_shape_files/tl_2015_us_csa.shp")
+}
+
+#cbsa's
+if (!file.exists("./admin_shape_files/tl_2015_us_cbsa.shp")) {
+    cbsa.shp <- core_based_statistical_areas(cb = FALSE, resolution = "500k", year = 2015)
+    unzip("./tl_2015_us_cbsa.zip", exdir = "./admin_shape_files")
+}
+if (file.exists("./admin_shape_files/tl_2015_us_cbsa.shp")) {
+    cbsa.shp <- readOGR("./admin_shape_files/tl_2015_us_cbsa.shp")
+}
+
+
+#file locations for no2 data----
+file.loc.omi <- "E:/Data/OMI_NO2_ver2_world (uncompressed)/"
+file.loc.metopA <- "E:/Data/NO2 Gome-2 Metop-A (ver 2-3) (uncompressed)/"
+file.loc.metopB <- "E:/Data/NO2 Gome-2 Metop-B (ver 2-3) (uncompressed)/"
+
+
+#file parameters for no2 data----
+number.of.years.covered <- length(years.covered)
+
+file.list <- list.files(file.loc.omi) #the omi, metopA and metopB files all have the same name within their respective folders.  Therefore, the file.list names are exactly the same for each sensor.
+number.of.files <- length(file.list)
+
+#file.list.omi <- list.files(file.loc.omi)
+#number.of.files.omi <- length(file.list.omi)
+
+#file.list.metopA <- list.files(file.loc.metopA)
+#number.of.files.metopA <- length(file.list.metopA)
+
+#file.list.metopB <- list.files(file.loc.metopB)
+#number.of.files.metopB <- length(file.list.metopB)
+
+year.list <- substring(file.list, 5, 8)
+month.list <- substring(file.list, 9, 10)
+
+
+
+#create objects to which the data from the loop will be added.
+#create an empty list
+datalist.yearly.states <- list()
+datalist.yearly.csa <- list()
+datalist.yearly.cbsa <- list()
+
+#create an empty list
+datalist.monthly.states <- list()
+datalist.monthly.csa <- list()
+datalist.monthly.cbsa <- list()
+
+#create a dataframe to which to add.
+#this/these df's are derived directly from the admin shapefiles.  
+states.df <- data.frame(states.shp)
+csa.df <- data.frame(csa.shp)
+cbsa.df <- data.frame(cbsa.shp)
+
+
+
+for (year in years.covered) {
+
+    file.list.for.year <- file.list[substring(file.list, 5, 8) == year] #selects the file names in file.list that correspond to a specific year.  #all the satelite sources have the same file names
+
+    #number.of.month.files <- length(file.list.for.year) #specifies the number of files corresponding to the specific year (12 for monthly data).
+
+    #file.list.one.year.metopA <- file.list.metopA[substring(file.list.metopA, 5, 8) == year] #selects the file names in file.list that correspond to a specific year.
+
+    #file.list.one.year.metopB <- file.list.metopB[substring(file.list.metopB, 5, 8) == year] #selects the file names in file.list that correspond to a specific year.
+
+    #x.stack <- brick(filename = "C:/Users/rbuch/Desktop/temp/brick")
+    x.stack <- brick()
+
+    #loop applies to the 12 months within the year specified by the above loop.
+    for (i in 1:12) {
+
+
+        #import omi data for each year
+        omi <- readGDAL(paste0(file.loc.omi, file.list.for.year[i]))
+        omi <- raster(omi)
+
+        omi.res <- raster(nrow = 1440, ncol = 2880) #this is the omi raster's original resolution. #This is to upsample metopA and B to match the omi's resolution.
+
+        #import and process metopA data for 2007 and later.
+        if (year >= 2007) {
+            metopA <- readGDAL(paste0(file.loc.metopA, file.list.for.year[i]))
+            metopA <- raster(metopA)
+            metopA <- resample(metopA, omi.res, method = "bilinear")
+            #function for tranforming metopA values to be more compatible with OMI values:
+            #multiply no2mean.metopA.cbsa by 0.757992 and add 42.195478.
+            f.metopA <- function(x) { x * 0.757992 + 42.195478 }
+            metopA <- calc(metopA, fun = f.metopA)
+        }
+
+        #import metopB data for 2012 and later.
+        if (year >= 2013) {
+            metopB <- readGDAL(paste0(file.loc.metopB, file.list.for.year[i]))
+            metopB <- raster(metopB)
+            metopB <- resample(metopB, omi.res, method = "bilinear")
+            #function for tranforming metopA values to be more compatible with OMI values:
+            #multiply no2mean.metopB.cbsa by 0.787274 and add 52.307152.
+            f.metopB <- function(x) { x * 0.787274 + 52.307152 }
+            metopB <- calc(metopB, fun = f.metopB)
+        }
+
+
+        #merge omi and metop into a single raster.
+        #where they overlap, values get priority in the order they are written--so the values are mostly from omi, with metopA and B's values only being used where omi has NA's.
+
+        no2 <- omi #no merging required for years before 2007
+
+        if (year >= 2007) {
+            no2 <- merge(omi, metopA) #merge omi and metopA data for years 2007 and after.
+        }
+
+        if (year >= 2012) {
+            no2 <- merge(omi, metopA, metopB) #~33Mb for low res  #merge omi, metopA and metopB data for 2012 and after.
+        }
+
+
+        #resample the combined no2 raster to the specified higher resolution.
+        no2.resample <- resample(no2, new.res, method = resample.method) #output around 132Mb when doubling resolution. #should add the monthly resample to a stack of rasters.
+
+
+
+        #x.stack <- no2.resample
+        x.stack <- addLayer(x.stack, no2.resample) #x.stack is 1.592Gb at low res. if all 12 months are present.
+
+
+        #rm(no2.resample) #this object is big, so I clear it from memory at the end of each part of the loop. 
+        #NOTE: rm()seems not to work in Visual studio--it removes the file from the environment, but not from RAM.
+
+    }
+
+    #extract averages of all cells within each admin unit (all using the same resampled raster stack).
+    #no2mean.monthly.usa <- extract(x.stack, usa.shp, fun = mean, weights = FALSE, na.rm = TRUE) #output is a matrix    #takes a very long time for some reason.
+    no2mean.monthly.states <- extract(x.stack, states.shp, fun = mean, weights = FALSE, na.rm = TRUE) #output is a matrix
+    no2mean.monthly.csa <- extract(x.stack, csa.shp, fun = mean, weights = FALSE, na.rm = TRUE) #output is a matrix
+    no2mean.monthly.cbsa <- extract(x.stack, cbsa.shp, fun = mean, weights = FALSE, na.rm = TRUE) #output is a matrix
+
+    no2mean.yearly.states <- rowMeans(no2mean.monthly.states, na.rm = FALSE) #vector of the rowmeans (which are the annual means)
+    no2mean.yearly.csa <- rowMeans(no2mean.monthly.csa, na.rm = FALSE) #vector of the rowmeans (which are the annual means)
+    no2mean.yearly.cbsa <- rowMeans(no2mean.monthly.cbsa, na.rm = FALSE) #vector of the rowmeans (which are the annual means)
+
+    no2mean.monthly.states <- as.data.frame(no2mean.monthly.states) #convert each matrix to a df.
+    no2mean.monthly.csa <- as.data.frame(no2mean.monthly.csa)
+    no2mean.monthly.cbsa <- as.data.frame(no2mean.monthly.cbsa)
+
+    no2mean.yearly.states <- as.data.frame(no2mean.yearly.states)
+    no2mean.yearly.csa <- as.data.frame(no2mean.yearly.csa)
+    no2mean.yearly.cbsa <- as.data.frame(no2mean.yearly.cbsa)
+
+    no2mean.yearly.states$year <- as.numeric(year) #adds a column with the corresponding year (as numeric)
+    no2mean.yearly.csa$year <- as.numeric(year) #adds a column with the corresponding year (as numeric)
+    no2mean.yearly.cbsa$year <- as.numeric(year) #adds a column with the corresponding year (as numeric)
+
+    no2mean.monthly.states$year <- as.numeric(year) #adds a column with the corresponding year (as numeric)
+    no2mean.monthly.csa$year <- as.numeric(year) #adds a column with the corresponding year (as numeric)
+    no2mean.monthly.cbsa$year <- as.numeric(year) #adds a column with the corresponding year (as numeric)
+
+
+    #bind df of values for each admin unit to the df of the appropriate admin shapefile.
+    #doing this associates the computed values with names and other identifiers of their associated admin units.
+    df.yearly.states <- cbind(states.df, no2mean.yearly.states)
+    df.yearly.csa <- cbind(csa.df, no2mean.yearly.csa)
+    df.yearly.cbsa <- cbind(cbsa.df, no2mean.yearly.cbsa)
+
+    df.monthly.states <- cbind(states.df, no2mean.monthly.states)
+    df.monthly.csa <- cbind(csa.df, no2mean.monthly.csa)
+    df.monthly.cbsa <- cbind(cbsa.df, no2mean.monthly.cbsa)
+
+
+
+    #inserts the totals computed in each iteration of the loop as a separate entry in the empty list object created before the loop.
+    datalist.yearly.states[[year]] <- df.yearly.states
+    datalist.yearly.csa[[year]] <- df.yearly.csa
+    datalist.yearly.cbsa[[year]] <- df.yearly.cbsa
+
+    datalist.monthly.states[[year]] <- df.monthly.states
+    datalist.monthly.csa[[year]] <- df.monthly.csa
+    datalist.monthly.cbsa[[year]] <- df.monthly.cbsa
+
+}
+
+#turn the lists created at the end of the loop into dataframes.
+no2means.yearly.states <- do.call(rbind, datalist.yearly.states)
+no2means.yearly.csa <- do.call(rbind, datalist.yearly.csa)
+no2means.yearly.cbsa <- do.call(rbind, datalist.yearly.cbsa)
+
+no2means.monthly.states <- do.call(rbind, datalist.monthly.states)
+no2means.monthly.csa <- do.call(rbind, datalist.monthly.csa)
+no2means.monthly.cbsa <- do.call(rbind, datalist.monthly.cbsa)
+
+
+
+#rm(x.stack) #this object is huge (~19.5Gb at full resolution), so I remove it at the end of each loop iteration.
+#NOTE: rm()seems not to work in Visual studio--it removes the file from the environment, but not from RAM or SSD.
+
+
+
+
+
+
+
+#write files----
+
+#export .csv files that automatically includes the resample resolution and year range in the file name.
+first.year.covered <- years.covered[1]
+last.year.covered <- years.covered[number.of.years.covered]
+years.covered.range <- paste(first.year.covered, last.year.covered, sep = ".")
+
+if (first.year.covered == last.year.covered) {
+    years.covered.range <- first.year.covered
+}
+
+#change these to write_excel_csv functions so they don't add the extra first column.
+write_csv(no2means.yearly.states, paste("./no2means.yearly.states", sensor.name, resample.method, res.char, years.covered.range, ".csv", sep = "_"))
+write_csv(no2means.yearly.csa, paste("./no2means.yearly.csa", sensor.name, resample.method, res.char, years.covered.range, ".csv", sep = "_"))
+write_csv(no2means.yearly.cbsa, paste("./no2means.yearly.cbsa", sensor.name, resample.method, res.char, years.covered.range, ".csv", sep = "_"))
+
+write_csv(no2means.monthly.states, paste("./no2means.monthly.states", sensor.name, resample.method, res.char, years.covered.range, ".csv", sep = "_"))
+write_csv(no2means.monthly.csa, paste("./no2means.monthly.csa", sensor.name, resample.method, res.char, years.covered.range, ".csv", sep = "_"))
+write_csv(no2means.monthly.cbsa, paste("./no2means.monthly.cbsa", sensor.name, resample.method, res.char, years.covered.range, ".csv", sep = "_"))
+
+
+
+
+
+#record runtime
+
+end.time <- Sys.time()
+total.time.elapsed <- end.time - start.time
+total.time.elapsed
+
+
+#copy total runtime for script to a file. 
+end.time <- as.character(Sys.time())
+df <- as.data.frame(end.time)
+df$total.time.elapsed <- total.time.elapsed
+write_excel_csv(df, "./script run times/US resample.csv", append = TRUE, col_names = TRUE)
+
+
+
